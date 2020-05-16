@@ -36,7 +36,7 @@ class FileCommands(CommandTestCase):
         self.client_session.wait_start = False  # fixme: this is super slow on tests
         return tx, btih
 
-    async def test_download_torrent(self):
+    async def _test_download_torrent(self):
         tx, btih = await self.initialize_torrent()
         self.assertNotIn('error', await self.out(self.daemon.jsonrpc_get('torrent')))
         self.assertItemCount(await self.daemon.jsonrpc_file_list(), 1)

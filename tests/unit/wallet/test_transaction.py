@@ -1,4 +1,7 @@
+import os
 import unittest
+import tempfile
+import shutil
 from binascii import hexlify, unhexlify
 from itertools import cycle
 
@@ -302,9 +305,11 @@ class TestTransactionSigning(AsyncioTestCase):
 class TransactionIOBalancing(AsyncioTestCase):
 
     async def asyncSetUp(self):
+        wallet_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, wallet_dir)
         self.ledger = Ledger({
-            'db': Database(':memory:'),
-            'headers': Headers(':memory:')
+            'db': Database(os.path.join(wallet_dir, 'blockchain.db')),
+            'headers': Headers(':memory:'),
         })
         await self.ledger.db.open()
         self.account = Account.from_dict(
@@ -357,6 +362,7 @@ class TransactionIOBalancing(AsyncioTestCase):
         return [round(o.amount/COIN, 2) for o in tx.outputs]
 
     async def test_basic_use_cases(self):
+        self.ledger.coin_selection_strategy = 'standard'
         self.ledger.fee_per_byte = int(.01*CENT)
 
         # available UTXOs for filling missing inputs
@@ -419,3 +425,68 @@ class TransactionIOBalancing(AsyncioTestCase):
         self.assertListEqual([0.01, 1], self.inputs(tx))
         # change is now needed to consume extra input
         self.assertListEqual([0.97], self.outputs(tx))
+
+    # async def test_basic_use_cases_sqlite(self):
+    #     self.ledger.coin_selection_strategy = 'sqlite'
+    #     self.ledger.fee_per_byte = int(.01*CENT)
+    #
+    #     # available UTXOs for filling missing inputs
+    #     utxos = await self.create_utxos([
+    #         1, 1, 3, 5, 10
+    #     ])
+    #
+    #     # pay 3 coins (3.02 w/ fees)
+    #     tx = await self.tx(
+    #         [],            # inputs
+    #         [self.txo(3)]  # outputs
+    #     )
+    #     # best UTXO match is 5 (as UTXO 3 will be short 0.02 to cover fees)
+    #     self.assertListEqual(self.inputs(tx), [1.0, 1.0, 3.0])
+    #     # a change of 1.98 is added to reach balance
+    #     self.assertListEqual(self.outputs(tx), [3, 1.98])
+    #
+    #     await self.ledger.release_outputs(utxos)
+    #
+    #     # pay 2.98 coins (3.00 w/ fees)
+    #     tx = await self.tx(
+    #         [],               # inputs
+    #         [self.txo(2.98)]  # outputs
+    #     )
+    #     # best UTXO match is 3 and no change is needed
+    #     self.assertListEqual(self.inputs(tx), [3])
+    #     self.assertListEqual(self.outputs(tx), [2.98])
+    #
+    #     await self.ledger.release_outputs(utxos)
+    #
+    #     # supplied input and output, but input is not enough to cover output
+    #     tx = await self.tx(
+    #         [self.txi(self.txo(10))],  # inputs
+    #         [self.txo(11)]             # outputs
+    #     )
+    #     # additional input is chosen (UTXO 3)
+    #     self.assertListEqual([10, 3], self.inputs(tx))
+    #     # change is now needed to consume extra input
+    #     self.assertListEqual([11, 1.96], self.outputs(tx))
+    #
+    #     await self.ledger.release_outputs(utxos)
+    #
+    #     # liquidating a UTXO
+    #     tx = await self.tx(
+    #         [self.txi(self.txo(10))],  # inputs
+    #         []                         # outputs
+    #     )
+    #     self.assertListEqual([10], self.inputs(tx))
+    #     # missing change added to consume the amount
+    #     self.assertListEqual([9.98], self.outputs(tx))
+    #
+    #     await self.ledger.release_outputs(utxos)
+    #
+    #     # liquidating at a loss, requires adding extra inputs
+    #     tx = await self.tx(
+    #         [self.txi(self.txo(0.01))],  # inputs
+    #         []                           # outputs
+    #     )
+    #     # UTXO 1 is added to cover some of the fee
+    #     self.assertListEqual([0.01, 1], self.inputs(tx))
+    #     # change is now needed to consume extra input
+    #     self.assertListEqual([0.97], self.outputs(tx))

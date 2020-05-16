@@ -244,12 +244,27 @@ class Ledger(metaclass=LedgerRegistry):
     def get_address_count(self, **constraints):
         return self.db.get_address_count(**constraints)
 
-    async def get_spendable_utxos(self, amount: int, funding_accounts):
+    async def get_spendable_utxos(self, amount: int, funding_accounts: Iterable['Account'], min_amount=100000):
+        accounts = tuple(funding_accounts)
+        if not accounts:
+            return []
         async with self._utxo_reservation_lock:
-            txos = await self.get_effective_amount_estimators(funding_accounts)
+            if self.coin_selection_strategy != 'sqlite':
+                print('got ', self.coin_selection_strategy)
+                txos = await self.get_effective_amount_estimators(funding_accounts)
+            else:
+                to_spend = await self.db.get_spendable_utxos(amount, accounts, min_amount=min_amount)
+                txos = []
+                for (raw, height, tx_position, verified), positions in to_spend.items():
+                    tx = Transaction(raw, height=height, is_verified=verified)
+                    for nout in positions:
+                        txos.append(tx.outputs[nout].get_estimator(self))
+
             fee = Output.pay_pubkey_hash(COIN, NULL_HASH32).get_fee(self)
             selector = CoinSelector(amount, fee)
-            spendables = selector.select(txos, self.coin_selection_strategy)
+            spendables = selector.select(
+                txos, 'standard' if self.coin_selection_strategy == 'sqlite' else self.coin_selection_strategy
+            )
             if spendables:
                 await self.reserve_outputs(s.txo for s in spendables)
             return spendables

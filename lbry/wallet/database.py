@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import platform
 from binascii import hexlify
+from collections import defaultdict
 from dataclasses import dataclass
 from contextvars import ContextVar
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -43,22 +44,21 @@ def initializer(path):
     reader_context.set(reader)
 
 
-def run_read_only_fetchall(sql, params):
+def run_read_only(fn, *args):
     cursor = reader_context.get().cursor
     try:
-        return cursor.execute(sql, params).fetchall()
+        return fn(cursor, *args)
     except (Exception, OSError) as e:
         log.exception('Error running transaction:', exc_info=e)
         raise
+
+
+def run_read_only_fetchall(sql, params):
+    return run_read_only(lambda conn: conn.execute(sql, params).fetchall())
 
 
 def run_read_only_fetchone(sql, params):
-    cursor = reader_context.get().cursor
-    try:
-        return cursor.execute(sql, params).fetchone()
-    except (Exception, OSError) as e:
-        log.exception('Error running transaction:', exc_info=e)
-        raise
+    return run_read_only(lambda conn: conn.execute(sql, params).fetchone())
 
 
 if platform.system() == 'Windows' or 'ANDROID_ARGUMENT' in os.environ:
@@ -136,10 +136,7 @@ class AIOSQLite:
     def executescript(self, script: str) -> Awaitable:
         return self.run(lambda conn: conn.executescript(script))
 
-    async def _execute_fetch(self, sql: str, parameters: Iterable = None,
-                             read_only=False, fetch_all: bool = False) -> List[dict]:
-        read_only_fn = run_read_only_fetchall if fetch_all else run_read_only_fetchone
-        parameters = parameters if parameters is not None else []
+    async def run_in_executor(self, read_only, fn, *args, disable_foreign_keys=False, **kwargs):
         still_waiting = False
         urgent_read = False
         if read_only:
@@ -155,30 +152,14 @@ class AIOSQLite:
                     await self.read_ready.wait()
                     still_waiting = True
                 return await asyncio.get_event_loop().run_in_executor(
-                    self.reader_executor, read_only_fn, sql, parameters
+                    self.reader_executor, run_read_only, fn, *args
                 )
             finally:
                 if urgent_read:
                     #  unthrottle the writers if they had to be throttled
                     self.urgent_read_done.set()
                 self.waiting_reads_metric.dec()
-        if fetch_all:
-            return await self.run(lambda conn: conn.execute(sql, parameters).fetchall())
-        return await self.run(lambda conn: conn.execute(sql, parameters).fetchone())
 
-    async def execute_fetchall(self, sql: str, parameters: Iterable = None,
-                               read_only=False) -> List[dict]:
-        return await self._execute_fetch(sql, parameters, read_only, fetch_all=True)
-
-    async def execute_fetchone(self, sql: str, parameters: Iterable = None,
-                               read_only=False) -> List[dict]:
-        return await self._execute_fetch(sql, parameters, read_only, fetch_all=False)
-
-    def execute(self, sql: str, parameters: Iterable = None) -> Awaitable[sqlite3.Cursor]:
-        parameters = parameters if parameters is not None else []
-        return self.run(lambda conn: conn.execute(sql, parameters))
-
-    async def run(self, fun, *args, **kwargs):
         self.write_count_metric.inc()
         self.waiting_writes_metric.inc()
         # it's possible many writes are coming in one after the other, these can
@@ -195,9 +176,13 @@ class AIOSQLite:
         # block readers
         self.read_ready.clear()
         try:
+            if disable_foreign_keys:
+                runner = self.__run_transaction_with_foreign_keys_disabled
+            else:
+                runner = self.__run_transaction
             async with self.write_lock:
                 return await asyncio.get_event_loop().run_in_executor(
-                    self.writer_executor, lambda: self.__run_transaction(fun, *args, **kwargs)
+                    self.writer_executor, lambda: runner(fn, *args, **kwargs)
                 )
         finally:
             self.writers -= 1
@@ -205,6 +190,31 @@ class AIOSQLite:
             if not self.writers:
                 # unblock the readers once the last enqueued writer finishes
                 self.read_ready.set()
+
+    async def _execute_fetch(self, sql: str, parameters: Iterable = None,
+                             read_only=False, fetch_all: bool = False) -> List[dict]:
+
+        if fetch_all:
+            fn = lambda conn: conn.execute(sql, parameters).fetchall()
+        else:
+            fn = lambda conn: conn.execute(sql, parameters).fetchone()
+        parameters = parameters if parameters is not None else []
+        return await self.run_in_executor(read_only, fn)
+
+    async def execute_fetchall(self, sql: str, parameters: Iterable = None,
+                               read_only=False) -> List[dict]:
+        return await self._execute_fetch(sql, parameters, read_only, fetch_all=True)
+
+    async def execute_fetchone(self, sql: str, parameters: Iterable = None,
+                               read_only=False) -> List[dict]:
+        return await self._execute_fetch(sql, parameters, read_only, fetch_all=False)
+
+    def execute(self, sql: str, parameters: Iterable = None) -> Awaitable[sqlite3.Cursor]:
+        parameters = parameters if parameters is not None else []
+        return self.run(lambda conn: conn.execute(sql, parameters))
+
+    async def run(self, fun, *args, **kwargs):
+        return await self.run_in_executor(False, fun, *args, **kwargs)
 
     def __run_transaction(self, fun: Callable[[sqlite3.Connection, Any, Any], Any], *args, **kwargs):
         self.writer_connection.execute('begin')
@@ -220,29 +230,11 @@ class AIOSQLite:
             raise
 
     async def run_with_foreign_keys_disabled(self, fun, *args, **kwargs):
-        self.write_count_metric.inc()
-        self.waiting_writes_metric.inc()
-        try:
-            await self.urgent_read_done.wait()
-        except Exception as e:
-            self.waiting_writes_metric.dec()
-            raise e
-        self.writers += 1
-        self.read_ready.clear()
-        try:
-            async with self.write_lock:
-                return await asyncio.get_event_loop().run_in_executor(
-                    self.writer_executor, self.__run_transaction_with_foreign_keys_disabled, fun, args, kwargs
-                )
-        finally:
-            self.writers -= 1
-            self.waiting_writes_metric.dec()
-            if not self.writers:
-                self.read_ready.set()
+        return await self.run_in_executor(False, fun, *args, disable_foreign_keys=True, **kwargs)
 
     def __run_transaction_with_foreign_keys_disabled(self,
                                                      fun: Callable[[sqlite3.Connection, Any, Any], Any],
-                                                     args, kwargs):
+                                                     *args, **kwargs):
         foreign_keys_enabled, = self.writer_connection.execute("pragma foreign_keys").fetchone()
         if not foreign_keys_enabled:
             raise sqlite3.IntegrityError("foreign keys are disabled, use `AIOSQLite.run` instead")
@@ -466,6 +458,39 @@ def dict_row_factory(cursor, row):
     return d
 
 
+def get_spendable_utxos(transaction: sqlite3.Connection, accounts, reserve_amount: int, floor: int):
+    txs = defaultdict(list)
+
+    accumulated = 0
+    multiplier = 10
+    gap_count = 0
+    accounts_fmt = ",".join(["?"] * len(accounts))
+    query = f"""
+        SELECT tx.txid, tx.raw, tx.position as tx_position, tx.height, txo.position as nout, tx.is_verified, txo.amount FROM txo
+        INNER JOIN account_address USING (address)
+        LEFT JOIN txi USING (txoid)
+        INNER JOIN tx USING (txid)
+        WHERE txo.txo_type=0 AND txi.txoid IS NULL AND tx.txid IS NOT NULL
+        AND txo.amount BETWEEN ? AND ?
+        AND account_address.account {'= ?' if len(accounts_fmt) == 1 else 'IN (' + accounts_fmt + ')'}
+    """
+    while accumulated < reserve_amount:
+        found_txs = False
+        for row in transaction.execute(query, (floor, floor * multiplier, *accounts)):
+            (txid, raw, tx_position, height, nout, verified, amount) = row.values()
+            found_txs = True
+            accumulated += amount
+            txs[(raw, height, tx_position, verified)].append(nout)
+            if accumulated >= reserve_amount:
+                break
+        if not found_txs:
+            gap_count += 1
+        if gap_count == 5:
+            break
+        floor *= multiplier
+    return txs
+
+
 class Database(SQLiteMixin):
 
     SCHEMA_VERSION = "1.3"
@@ -665,6 +690,12 @@ class Database(SQLiteMixin):
         # 1. delete transactions above_height
         # 2. update address histories removing deleted TXs
         return True
+
+    async def get_spendable_utxos(self, reserve_amount, accounts, min_amount: int = 100000):
+        print(accounts)
+        return await self.db.run_in_executor(
+            True, get_spendable_utxos, tuple(account.id for account in accounts), reserve_amount, min_amount
+        )
 
     async def select_transactions(self, cols, accounts=None, read_only=False, **constraints):
         if not {'txid', 'txid__in'}.intersection(constraints):
